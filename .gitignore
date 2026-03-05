@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+src/__pycache__/
+src/*.egg-info/
+
+# Virtual environment
+.venv/
+
+# LaTeX auxiliary files
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.bbl
+*.blg
+*.nav
+*.snm
+*.vrb
+
+# Large data files
+sim_512.dat
+recon*.npy
+
+# Solver output files
+sample_matrix.csv
+sample_rhs.csv
+sample_sparse.npz
+solution.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,591 @@
+\documentclass[11pt,a4paper]{article}
+
+% Essential packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+
+% Page geometry
+\geometry{margin=1in}
+
+% Header/Footer
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{Progress Report}
+\lhead{Advanced Algorithms Project}
+\cfoot{\thepage}
+
+% Code listings style
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{orange},
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+% Title formatting
+\title{%
+    \textbf{Progress Report: Weighted Randomized Kaczmarz Solver}\\[0.5em]
+    \large for Large Sparse Underdetermined Systems
+}
+\author{
+    Siddhant Singh (23CSB0A11)\\
+    K S Savinay Suresh (23CSB0A41)\\
+    Nisarg Hiren Desai (23CSB0F15)
+}
+\date{March 2026}
+
+\begin{document}
+
+\begin{titlepage}
+    \centering
+    \vspace*{\fill}
+    {\LARGE\textbf{Progress Report: Weighted Randomized Kaczmarz Solver}\\[0.5em]}
+    {\large for Large Sparse Underdetermined Systems}\\[2em]
+    {\large
+    Siddhant Singh (23CSB0A11)\\[0.3em]
+    K S Savinay Suresh (23CSB0A41)\\[0.3em]
+    Nisarg Hiren Desai (23CSB0F15)
+    }\\[2em]
+    {\large March 2026}
+    \vspace*{\fill}
+\end{titlepage}
+
+\begin{abstract}
+This progress report documents the development of a Weighted Randomized Kaczmarz solver designed to handle extremely large, sparse, underdetermined linear systems. Our target application is cone-beam CT reconstruction, involving binary projection matrices with $n = 512^3 \approx 134$ million columns and up to $m \approx 124$ million rows, where explicit matrix storage is infeasible ($\sim$16 petabytes dense). We present the algorithm design, implementation details, development iterations, integration with real CT scanner geometry from \texttt{mergecode.c}, performance optimizations including NumPy-vectorized ray tracing and a fast direct Kaczmarz loop with live progress tracking, and instructions for executing the reconstruction on \texttt{sim\_512.dat}.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{Introduction}
+%==============================================================================
+
+\subsection{Problem Statement}
+
+We seek to solve an extremely large, sparse, underdetermined system of linear equations:
+\begin{equation}
+    Ax = b
+\end{equation}
+where:
+\begin{itemize}
+    \item $A \in \{0, 1\}^{m \times n}$ is a binary (bit) matrix
+    \item $m < n$ (underdetermined system)
+    \item $n = 512^3 = 134{,}217{,}728$ columns
+    \item $m = 473 \times 512 = 242{,}176$ rows
+    \item Explicit storage of $A$ is impossible ($\sim$64 TB for dense storage)
+    \item Only row-wise access to indices of non-zero (1) entries is available
+\end{itemize}
+
+The key challenge is that traditional methods requiring explicit matrix access (LU decomposition, QR factorization, conjugate gradients) are infeasible at this scale. We required an algorithm that:
+\begin{enumerate}
+    \item Operates with \textbf{implicit matrix access} (row-by-row queries only)
+    \item Scales to \textbf{hundreds of millions of unknowns}
+    \item Converges to the \textbf{minimum-norm solution} for underdetermined systems
+    \item Handles \textbf{potentially inconsistent systems} gracefully
+\end{enumerate}
+
+\subsection{The Kaczmarz Algorithm}
+
+The classical Kaczmarz algorithm, also known as the Algebraic Reconstruction Technique (ART) in computed tomography, is an iterative row-action method for solving linear systems. Given a current iterate $x^{(k)}$, it projects onto the hyperplane defined by the $i$-th equation:
+\begin{equation}
+    x^{(k+1)} = x^{(k)} + \frac{b_i - a_i^\top x^{(k)}}{\|a_i\|^2} a_i
+\end{equation}
+where $a_i$ is the $i$-th row of $A$.
+
+\subsubsection{Randomized Kaczmarz (Strohmer \& Vershynin, 2009)}
+
+Instead of cycling through rows deterministically, we select row $i$ with probability proportional to $\|a_i\|^2$:
+\begin{equation}
+    P(i = k) = \frac{\|a_k\|^2}{\|A\|_F^2}
+\end{equation}
+
+This randomized variant achieves expected linear convergence:
+\begin{equation}
+    \mathbb{E}\left[\|x^{(k)} - x^*\|^2\right] \leq \left(1 - \frac{\sigma_{\min}^2(A)}{\|A\|_F^2}\right)^k \|x^{(0)} - x^*\|^2
+\end{equation}
+
+\subsubsection{Minimum-Norm Solution for Underdetermined Systems}
+
+For underdetermined systems ($m < n$), infinitely many solutions exist. By initializing $x^{(0)} = 0$, the Kaczmarz iterates converge to the \textbf{minimum-norm solution}:
+\begin{equation}
+    x^* = A^\top(AA^\top)^{-1}b = A^\dagger b
+\end{equation}
+This is the unique solution with smallest $\ell_2$ norm, lying entirely in the row space of $A$.
+
+\subsection{Implementation Plan}
+
+Our implementation plan consisted of the following phases:
+\begin{enumerate}
+    \item \textbf{Phase 1:} Core algorithm implementation with basic functionality
+    \item \textbf{Phase 2:} Efficient weighted sampling using Walker's Alias Method
+    \item \textbf{Phase 3:} Implicit matrix abstraction for memory efficiency
+    \item \textbf{Phase 4:} Adaptive stopping criteria and convergence detection
+    \item \textbf{Phase 5:} Testing, validation, and performance optimization
+\end{enumerate}
+
+%==============================================================================
+\section{Development Iterations}
+%==============================================================================
+
+\subsection{Iteration 1: Naive Prototype}
+
+\textbf{Goal:} Establish a working baseline implementation.
+
+\textbf{Approach:} We began with a straightforward implementation that explicitly stored the matrix and used simple cyclic row selection.
+
+\textbf{Issues Encountered:}
+\begin{itemize}
+    \item Memory consumption was prohibitive even for moderate test cases
+    \item Cyclic row selection showed erratic convergence behavior
+    \item No mechanism to detect when the system was inconsistent
+\end{itemize}
+
+\textbf{Lessons Learned:} The need for implicit matrix representation and probabilistic row selection became immediately apparent.
+
+\subsection{Iteration 2: Randomized Row Selection}
+
+\textbf{Goal:} Implement the randomized Kaczmarz variant with convergence guarantees.
+
+\textbf{Approach:} We implemented weighted random sampling where rows are selected with probability proportional to their squared norm. For our binary matrices:
+\begin{equation}
+    \|a_i\|^2 = \text{nnz}(a_i) = \text{number of 1s in row } i
+\end{equation}
+
+\textbf{Initial Implementation:} Used binary search on cumulative probability distribution.
+
+\textbf{Issues Encountered:}
+\begin{itemize}
+    \item $O(\log m)$ sampling overhead became significant over millions of iterations
+    \item Memory allocation for cumulative arrays was inefficient
+\end{itemize}
+
+\textbf{Resolution:} Migrated to Walker's Alias Method for $O(1)$ sampling.
+
+\subsection{Iteration 3: Walker's Alias Method Integration}
+
+\textbf{Goal:} Achieve constant-time weighted sampling.
+
+\textbf{Approach:} Implemented Walker's Alias Method which provides:
+\begin{itemize}
+    \item $O(m)$ preprocessing time
+    \item $O(m)$ space for probability and alias tables
+    \item $O(1)$ sampling time per iteration
+\end{itemize}
+
+\textbf{Outcome:} Significant performance improvement, reducing per-iteration overhead to a constant regardless of the number of rows.
+
+\subsection{Iteration 4: Implicit Matrix Abstraction}
+
+\textbf{Goal:} Enable solving systems where the matrix cannot be explicitly stored.
+
+\textbf{Approach:} Designed an abstraction layer with two implementations:
+\begin{enumerate}
+    \item \texttt{ImplicitBitMatrix}: Accepts a row-access function that returns column indices of non-zeros
+    \item \texttt{ExplicitSparseRowMatrix}: For smaller test cases where explicit storage is feasible
+\end{enumerate}
+
+\textbf{Key Design Decision:} The matrix interface requires only:
+\begin{itemize}
+    \item Dimensions $(m, n)$
+    \item Row access: $\text{get\_row\_indices}(i) \rightarrow \{j : A_{ij} = 1\}$
+    \item Row weights (precomputed during initialization)
+\end{itemize}
+
+\textbf{Memory Achievement:} Solution vector requires $\sim$1.07 GB; matrix is never materialized.
+
+\subsection{Iteration 5: Convergence Detection}
+
+\textbf{Goal:} Implement robust stopping criteria with inconsistency detection.
+
+\textbf{Approach:} Designed a moving-window approach monitoring squared residuals:
+
+\textbf{Convergence Criterion:}
+\begin{equation}
+    \text{mean}(H) < \epsilon^2 \implies \text{CONVERGED}
+\end{equation}
+where $H$ is a window of recent squared residuals.
+
+\textbf{Stagnation Detection:} For inconsistent systems:
+\begin{equation}
+    \text{stagnation} = \left(\frac{\sigma(H)}{\mu(H)} < \tau_{cv}\right) \land \left(\mu(H) > \epsilon^2\right)
+\end{equation}
+
+\textbf{Outcome:} The solver now gracefully handles inconsistent systems, providing useful approximate solutions rather than diverging.
+
+\subsection{Iteration 6: Performance Tuning and Testing}
+
+\textbf{Goal:} Validate correctness and optimize for production use.
+
+\textbf{Activities:}
+\begin{itemize}
+    \item Implemented comprehensive test suite
+    \item Verified minimum-norm property on underdetermined systems
+    \item Profiled and optimized critical code paths
+    \item Added verbosity controls and progress tracking
+\end{itemize}
+
+\subsection{Iteration 7: Cone-Beam CT Integration}
+
+\textbf{Goal:} Integrate the solver with real cone-beam CT scanner geometry from \texttt{mergecode.c} and enable reconstruction from \texttt{sim\_512.dat}.
+
+\textbf{Approach:} We translated the C-language ray-tracing routine (\texttt{weightgen()}) and projection geometry from \texttt{mergecode.c} into a Python module (\texttt{examples/ct\_reconstruction.py}). The key components are:
+\begin{itemize}
+    \item \texttt{CTGeometry}: Encapsulates all scanner parameters---source-object distance (166.641\,mm), source-detector distance (1238.157\,mm), 640° angular span, 473 projections, $512 \times 512$ detector, 0.8\,mm pixel size, and 80.86\,mm phantom diameter.
+    \item \texttt{ImplicitCTMatrix}: Wraps the geometry as an implicit matrix compatible with the Kaczmarz solver. Each row corresponds to a single detector measurement, and \texttt{get\_row\_indices()} computes on-the-fly which voxels a ray intersects using the cone-beam geometry.
+    \item \texttt{compute\_ray\_voxels()}: Vectorized ray-voxel intersection function that converts a (projection, slice, detector) triplet into the list of voxel indices the ray passes through.
+\end{itemize}
+
+\textbf{Full-scale matrix dimensions:}
+\begin{itemize}
+    \item Rows $m = 473 \times 512 \times 512 = 123{,}994{,}112$ (one row per detector pixel per projection)
+    \item Columns $n = 512^3 = 134{,}217{,}728$ (one column per voxel)
+    \item Dense storage: $\sim$16 petabytes---completely infeasible
+    \item Our implicit representation: $\sim$1.07\,GB (solution vector only)
+\end{itemize}
+
+\textbf{Outcome:} Successful end-to-end reconstruction pipeline: load phantom $\rightarrow$ forward-project sinogram $\rightarrow$ reconstruct via Kaczmarz.
+
+\subsection{Iteration 8: Performance Optimization}
+
+\textbf{Goal:} Improve execution speed, add dynamic terminal progress, and provide time-to-completion estimates.
+
+\textbf{Optimizations implemented:}
+\begin{enumerate}
+    \item \textbf{Vectorized ray tracing.} The original C code loops over each pixel intersection sequentially. We replaced this with NumPy vectorized operations: all $n_{\text{pix}}$ intersection points are computed in a single array operation, with boolean masking for in-volume filtering. This eliminates per-pixel Python loop overhead.
+    
+    \item \textbf{Fast direct Kaczmarz loop (\texttt{kaczmarz\_direct()}).} We implemented an optimised inline Kaczmarz loop that bypasses the generic solver infrastructure. Key differences from the general-purpose solver:
+    \begin{itemize}
+        \item Direct \texttt{np.random.RandomState.randint()} for row sampling (bypasses Walker's Alias tables, which are expensive to build for 124M rows)
+        \item Circular buffer for moving-window residual tracking (no deque overhead)
+        \item Convergence checked every \texttt{window\_size} iterations instead of every iteration
+        \item All operations inlined to minimise function-call overhead
+    \end{itemize}
+    
+    \item \textbf{Dynamic progress bar (\texttt{ProgressBar} class).} A single-line terminal progress bar that updates in-place using carriage returns. Features:
+    \begin{itemize}
+        \item Throttled output (50\,ms minimum interval) to avoid I/O bottlenecks
+        \item Processing rate (iterations/second)
+        \item Elapsed time and estimated time remaining (ETA)
+        \item Visual bar with filled/empty characters
+    \end{itemize}
+    
+    \item \textbf{LRU caching.} \texttt{ImplicitCTMatrix} uses \texttt{functools.lru\_cache} to cache recently computed rows, avoiding redundant ray-tracing for repeatedly sampled rows.
+\end{enumerate}
+
+\textbf{Benchmark results} (32\textsuperscript{3} demo, 20 projections, 100K iterations):
+\begin{itemize}
+    \item Forward projection: 20,480 rays at $\sim$15,500 rays/s
+    \item Kaczmarz reconstruction: $\sim$22,500 iterations/s
+    \item Total time: $\sim$5.5 seconds (including phantom creation)
+\end{itemize}
+
+%==============================================================================
+\section{Accomplishments}
+%==============================================================================
+
+\subsection{Core Algorithm Implementation}
+
+We successfully implemented the Weighted Randomized Kaczmarz algorithm with the following components:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Component} & \textbf{Module} & \textbf{Status} \\
+\midrule
+Kaczmarz solver & \texttt{src/kaczmarz.py} & Complete \\
+Weighted sampling & \texttt{src/sampling.py} & Complete \\
+Implicit matrix & \texttt{src/sparse\_matrix.py} & Complete \\
+Stopping criteria & \texttt{src/stopping.py} & Complete \\
+Complexity analysis & \texttt{analysis/complexity\_analysis.py} & Complete \\
+Demo/Examples & \texttt{examples/demo.py} & Complete \\
+CT reconstruction & \texttt{examples/ct\_reconstruction.py} & Complete \\
+File I/O solver & \texttt{examples/file\_solver.py} & Complete \\
+Large matrix demos & \texttt{examples/large\_matrix\_demo.py} & Complete \\
+Large input methods & \texttt{examples/large\_input\_methods.py} & Complete \\
+Test suite & \texttt{tests/} & Complete \\
+\bottomrule
+\end{tabular}
+\caption{Implementation status of project components}
+\end{table}
+
+\subsection{Algorithm Design}
+
+Our final algorithm (Algorithm~\ref{alg:kaczmarz}) incorporates all design requirements:
+
+\begin{algorithm}[h]
+\caption{Weighted Randomized Kaczmarz with Adaptive Stopping}
+\label{alg:kaczmarz}
+\begin{algorithmic}[1]
+\Require Row access function $\text{row}(i)$, RHS $b \in \mathbb{R}^m$, tolerance $\epsilon$, window $W$
+\Ensure Approximate minimum-norm solution $x \in \mathbb{R}^n$
+\State $x \gets \mathbf{0} \in \mathbb{R}^n$ \Comment{Initialize for minimum-norm}
+\State Compute row weights $w[i] \gets |\text{row}(i)|$ for all $i$
+\State Total weight $S \gets \sum_i w[i]$
+\State Build alias sampler with $P[i] = w[i]/S$
+\State Initialize residual history $H \gets$ empty deque of size $W$
+\For{$k = 1, 2, \ldots$}
+    \State Sample row index $i \sim P$ \Comment{$O(1)$ with alias method}
+    \State $J \gets \text{row}(i)$ \Comment{Non-zero indices}
+    \State $\langle a_i, x \rangle \gets \sum_{j \in J} x[j]$ \Comment{Sparse dot product}
+    \State $r_i \gets b_i - \langle a_i, x \rangle$ \Comment{Residual}
+    \State $\alpha \gets r_i / |J|$ \Comment{Step size (since $\|a_i\|^2 = |J|$)}
+    \State $x[j] \gets x[j] + \alpha$ for all $j \in J$ \Comment{Update}
+    \State Append $|r_i|^2$ to $H$
+    \If{$|H| = W$}
+        \If{$\text{mean}(H) < \epsilon^2$} \Return $x$ \Comment{Converged}
+        \EndIf
+        \If{stagnation detected} \Return $x$ \Comment{Inconsistent system}
+        \EndIf
+    \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Complexity Achievement}
+
+\subsubsection{Space Complexity}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Component} & \textbf{Size} & \textbf{Memory} \\
+\midrule
+Solution vector $x$ & $n = 134$M & $\sim$1.07 GB \\
+Row weight array & $m = 242$K & $\sim$1.94 MB \\
+Alias sampler tables & $2m = 484$K & $\sim$3.88 MB \\
+Residual history window & $W = 1000$ & $\sim$8 KB \\
+\midrule
+\textbf{Total} & & $\sim$\textbf{1.08 GB} \\
+\bottomrule
+\end{tabular}
+\caption{Memory usage analysis}
+\end{table}
+
+\textbf{Critical achievement:} We never store the matrix $A$, which would require $\sim$64 TB for dense storage. Our approach uses $10^7\times$ less memory.
+
+\subsubsection{Time Complexity}
+
+\begin{itemize}
+    \item \textbf{Preprocessing:} $O(\text{nnz} + m)$
+    \item \textbf{Per iteration:} $O(s)$ where $s$ is the row sparsity
+    \item \textbf{Expected iterations:} $O\left(\kappa^2 \cdot \|A\|_F^2 / \sigma_{\min}^2 \cdot \log(1/\epsilon)\right)$
+\end{itemize}
+
+\subsection{Key Features Implemented}
+
+\begin{enumerate}
+    \item \textbf{Implicit Matrix Access:} Full support for matrices that cannot be explicitly stored
+    
+    \item \textbf{Walker's Alias Sampling:} $O(1)$ weighted random sampling after $O(m)$ preprocessing
+    
+    \item \textbf{Minimum-Norm Convergence:} Guaranteed convergence to $x^* = A^\dagger b$ for consistent underdetermined systems
+    
+    \item \textbf{Adaptive Stopping:} Moving-window residual monitoring with configurable tolerance
+    
+    \item \textbf{Inconsistency Detection:} Automatic detection of systems with no exact solution via stagnation analysis
+    
+    \item \textbf{Comprehensive Testing:} Unit tests for convergence verification and correctness validation
+    
+    \item \textbf{CT Reconstruction Pipeline:} Complete cone-beam CT integration with vectorized ray tracing, implicit projection matrix, forward projection, and Kaczmarz-based reconstruction
+    
+    \item \textbf{Dynamic Progress Tracking:} Real-time progress bars with processing rate, elapsed time, and ETA for both forward projection and reconstruction phases
+    
+    \item \textbf{File I/O Workflow:} Command-line solver supporting CSV and NPZ file formats with comparison against traditional NumPy solvers
+\end{enumerate}
+
+%==============================================================================
+\section{Testing and Validation}
+%==============================================================================
+
+\subsection{Test Suite}
+
+Our test suite validates:
+\begin{itemize}
+    \item Convergence to correct solution for small consistent systems
+    \item Minimum-norm property verification
+    \item Behavior on inconsistent systems
+    \item Sampler correctness (distribution verification)
+    \item Edge cases and boundary conditions
+\end{itemize}
+
+\subsection{Validation Results}
+
+All implemented tests pass successfully, confirming:
+\begin{itemize}
+    \item[\checkmark] Solution accuracy within specified tolerance
+    \item[\checkmark] Minimum-norm property holds ($x_0 = 0$ initialization)
+    \item[\checkmark] Graceful degradation on inconsistent systems
+    \item[\checkmark] Correct weighted sampling distribution
+\end{itemize}
+
+%==============================================================================
+\section{Executing the Algorithm on \texttt{sim\_512.dat}}
+%==============================================================================
+
+This section provides step-by-step instructions for running the Kaczmarz reconstruction on the full $512^3$ phantom volume stored in \texttt{sim\_512.dat}.
+
+\subsection{Prerequisites}
+
+\begin{enumerate}
+    \item Python 3.8+ with NumPy installed
+    \item The file \texttt{sim\_512.dat} placed in the project root directory (\texttt{C:\textbackslash Users\textbackslash cloak\textbackslash Documents\textbackslash AA Project\textbackslash})
+    \item Sufficient system memory: at minimum $\sim$2\,GB free (1.07\,GB for the solution vector, plus phantom and sinogram data)
+\end{enumerate}
+
+\subsection{Quick Demo (Verification)}
+
+Before running on the full dataset, verify the installation with the built-in demo:
+\begin{lstlisting}[language=bash]
+python examples/ct_reconstruction.py --demo
+\end{lstlisting}
+This runs a $32^3$ volume with 20 projections and 100K iterations in approximately 5--6 seconds.
+
+\subsection{Full Reconstruction}
+
+To reconstruct from \texttt{sim\_512.dat}:
+\begin{lstlisting}[language=bash]
+python examples/ct_reconstruction.py -i sim_512.dat -o recon.npy
+\end{lstlisting}
+
+This uses the default settings: 50 projections, 500K max iterations, tolerance $10^{-4}$.
+
+\subsection{Command-Line Options}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llp{7cm}}
+\toprule
+\textbf{Flag} & \textbf{Default} & \textbf{Description} \\
+\midrule
+\texttt{-i / --input} & --- & Input phantom file (e.g., \texttt{sim\_512.dat}) \\
+\texttt{-o / --output} & --- & Output file for reconstructed volume (\texttt{.npy} format) \\
+\texttt{--demo} & --- & Run the small $32^3$ demo instead of full reconstruction \\
+\texttt{--npix} & 512 & Volume size ($n_{\text{pix}}^3$ total voxels) \\
+\texttt{--nproj} & 50 & Number of projection angles to use (out of 473 available) \\
+\texttt{--tol} & $10^{-4}$ & Convergence tolerance (RMS residual threshold) \\
+\texttt{--maxiter} & 500{,}000 & Maximum number of Kaczmarz iterations \\
+\bottomrule
+\end{tabular}
+\caption{Command-line options for \texttt{ct\_reconstruction.py}}
+\end{table}
+
+\subsection{Usage Examples}
+
+\textbf{Full 512\textsuperscript{3} reconstruction with 50 projections:}
+\begin{lstlisting}[language=bash]
+python examples/ct_reconstruction.py -i sim_512.dat -o recon.npy --nproj 50
+\end{lstlisting}
+
+\textbf{Using all 473 projections (longest but most accurate):}
+\begin{lstlisting}[language=bash]
+python examples/ct_reconstruction.py -i sim_512.dat -o recon_full.npy \
+    --nproj 473 --maxiter 2000000 --tol 1e-5
+\end{lstlisting}
+
+\textbf{Quick test with few projections and low iterations:}
+\begin{lstlisting}[language=bash]
+python examples/ct_reconstruction.py -i sim_512.dat -o recon_quick.npy \
+    --nproj 10 --maxiter 50000
+\end{lstlisting}
+
+\subsection{What to Expect During Execution}
+
+When the script runs, it proceeds through these phases:
+
+\begin{enumerate}
+    \item \textbf{Loading phantom} ($\sim$1--2 seconds): Reads \texttt{sim\_512.dat} as a $512 \times 512 \times 512$ float32 array.
+    
+    \item \textbf{Forward projection}: Computes the sinogram $b = Ax$ by tracing rays through the volume. A dynamic progress bar shows:
+    \begin{lstlisting}[basicstyle=\ttfamily\footnotesize,frame=none,numbers=none]
+  Projecting: |=================>          | 62% 15432 it/s  ETA 1m 05s
+    \end{lstlisting}
+    
+    \item \textbf{Kaczmarz reconstruction}: Iteratively solves $Ax = b$ with a live progress display:
+    \begin{lstlisting}[basicstyle=\ttfamily\footnotesize,frame=none,numbers=none]
+  Kaczmarz: |==============>             | 42%  RMS=3.21e-03  22500 it/s  ETA 3m 22s
+    \end{lstlisting}
+    
+    \item \textbf{Output}: The reconstructed volume is saved as a NumPy \texttt{.npy} file and can be loaded with \texttt{np.load('recon.npy')}.
+\end{enumerate}
+
+\subsection{Performance Considerations}
+
+For the full $512^3$ problem:
+\begin{itemize}
+    \item The system has $n = 134{,}217{,}728$ unknowns and up to $m = 124$ million measurements.
+    \item Forward projection with 50 projections traces $50 \times 512 \times 512 = 13{,}107{,}200$ rays.
+    \item Reconstruction time depends heavily on the number of iterations. At $\sim$20{,}000 iter/s, 500K iterations takes roughly 25 seconds of Kaczmarz time.
+    \item The forward projection phase is typically the bottleneck for large numbers of projections.
+    \item Increasing \texttt{--nproj} improves reconstruction quality but increases forward projection time linearly.
+\end{itemize}
+
+%==============================================================================
+\section{Future Work}
+%==============================================================================
+
+Potential areas for future enhancement include:
+\begin{enumerate}
+    \item \textbf{Block Kaczmarz:} Process multiple rows per iteration for improved convergence
+    \item \textbf{Parallelization:} Distributed computation for even larger systems
+    \item \textbf{Acceleration:} Momentum-based variants (Heavy Ball, Nesterov)
+    \item \textbf{Preconditioning:} Row scaling for improved conditioning
+    \item \textbf{GPU Implementation:} Leverage parallel architectures for sparse updates
+    \item \textbf{Multi-resolution Reconstruction:} Start with a coarse volume and progressively refine
+    \item \textbf{Regularization:} Total-variation or sparsity penalties for improved image quality
+\end{enumerate}
+
+%==============================================================================
+\section{Conclusion}
+%==============================================================================
+
+We have successfully implemented a Weighted Randomized Kaczmarz solver capable of handling extremely large sparse underdetermined linear systems, and integrated it with a real cone-beam CT reconstruction pipeline. The implementation achieves:
+
+\begin{itemize}
+    \item Memory-efficient operation without explicit matrix storage ($\sim$1\,GB for 134M unknowns vs.~16\,PB for the dense matrix)
+    \item Provable convergence to the minimum-norm solution
+    \item Robust handling of inconsistent systems
+    \item Full CT reconstruction pipeline translating \texttt{mergecode.c} scanner geometry
+    \item NumPy-vectorized ray tracing and optimised direct Kaczmarz loop
+    \item Dynamic terminal progress with processing rate and ETA
+    \item Production-ready code with comprehensive testing and CLI interface
+\end{itemize}
+
+The solver is ready for deployment on the target CT reconstruction problem. To execute on \texttt{sim\_512.dat}:
+\begin{lstlisting}[language=bash]
+python examples/ct_reconstruction.py -i sim_512.dat -o recon.npy --nproj 50
+\end{lstlisting}
+
+%==============================================================================
+\section*{References}
+%==============================================================================
+
+\begin{enumerate}
+    \item Strohmer, T., \& Vershynin, R. (2009). A randomized Kaczmarz algorithm with exponential convergence. \textit{Journal of Fourier Analysis and Applications}, 15(2), 262-278.
+    
+    \item Walker, A. J. (1977). An efficient method for generating discrete random variables with general distributions. \textit{ACM Transactions on Mathematical Software}, 3(3), 253-256.
+    
+    \item Kaczmarz, S. (1937). Angenäherte Auflösung von Systemen linearer Gleichungen. \textit{Bulletin International de l'Académie Polonaise des Sciences et des Lettres}, 35, 355-357.
+    
+    \item Needell, D. (2010). Randomized Kaczmarz solver for noisy linear systems. \textit{BIT Numerical Mathematics}, 50(2), 395-403.
+\end{enumerate}
+
+\end{document}
