@@ -10,7 +10,6 @@ Key features:
 - Stagnation detection for inconsistent systems
 - Graceful degradation to least-squares behavior
 
-Author: Advanced Algorithms Student
 Date: January 2026
 """
 

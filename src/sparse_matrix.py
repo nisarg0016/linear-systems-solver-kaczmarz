@@ -5,7 +5,6 @@ This module provides an abstraction layer for extremely large sparse binary matr
 that cannot be explicitly materialized in memory. Access is provided only through
 row-wise queries that return the indices of non-zero (1) entries.
 
-Author: Advanced Algorithms Student
 Date: January 2026
 """
 

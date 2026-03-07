@@ -7,7 +7,6 @@ to row weight (squared norm).
 
 For binary matrices: P(row i) = nnz(row_i) / nnz(A)
 
-Author: Advanced Algorithms Student
 Date: January 2026
 """
 

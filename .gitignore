@@ -7,6 +7,7 @@ dist/
 build/
 src/__pycache__/
 src/*.egg-info/
+*.ipynb
 
 # Virtual environment
 .venv/
@@ -28,6 +29,8 @@ src/*.egg-info/
 # Large data files
 sim_512.dat
 recon*.npy
+recon*.bin
+*.exe
 
 # Solver output files
 sample_matrix.csv

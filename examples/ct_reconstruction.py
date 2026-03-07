@@ -11,8 +11,6 @@ The matrix A represents the CT projection geometry where:
 
 Input: sim_512.dat (512x512x512 phantom volume)
 Output: Reconstructed volume
-
-Author: AA Project
 """
 
 import numpy as np
@@ -387,7 +385,9 @@ def kaczmarz_direct(
     n_voxels: int,
     tolerance: float = 1e-4,
     max_iterations: int = 1_000_000,
-    seed: int = 42
+    seed: int = 42,
+    relaxation: float = 0.25,
+    enforce_nonnegativity: bool = True
 ) -> Tuple[np.ndarray, dict]:
     """
     Fast direct Kaczmarz loop optimised for CT reconstruction.
@@ -396,6 +396,10 @@ def kaczmarz_direct(
     inlining the iteration, sampling, and convergence check.
     Provides a live progress bar with ETA in the terminal.
     
+    Key improvements for CT quality:
+    - Under-relaxation (lambda < 1) prevents overshooting
+    - Non-negativity constraint acts as a powerful regulariser
+    
     Args:
         ct_matrix: ImplicitCTMatrix with the projection geometry
         b: Sinogram vector (measurements)
@@ -403,6 +407,11 @@ def kaczmarz_direct(
         tolerance: Stop when RMS residual drops below this
         max_iterations: Hard iteration cap
         seed: Random seed
+        relaxation: Relaxation parameter lambda in (0, 2). Values < 1
+                    under-relax (more stable), > 1 over-relax (faster
+                    but may diverge). Recommended: 0.25 for CT.
+        enforce_nonnegativity: If True, clamp voxel values >= 0 after
+                               each update (CT physical constraint).
     
     Returns:
         (x, info_dict) where x is the solution vector and info_dict
@@ -428,6 +437,8 @@ def kaczmarz_direct(
     # Initial calibration: run 1000 iterations to estimate speed
     print(f"  Max iterations : {max_iterations:,}")
     print(f"  Tolerance      : {tolerance:.1e}")
+    print(f"  Relaxation     : {relaxation}")
+    print(f"  Non-negativity : {enforce_nonnegativity}")
     print(f"  Window size    : {window_size:,}")
     print()
     
@@ -441,8 +452,12 @@ def kaczmarz_direct(
         
         dot = np.sum(x[indices])
         residual = b[i] - dot
-        alpha = residual / weight
+        alpha = relaxation * residual / weight
         x[indices] += alpha
+        
+        # Non-negativity constraint (physical: CT values >= 0)
+        if enforce_nonnegativity:
+            x[indices] = np.maximum(x[indices], 0.0)
         
         r_sq = residual * residual
         
@@ -510,7 +525,9 @@ def kaczmarz_direct(
 def reconstruct_kaczmarz(geom: CTGeometry, sinogram: np.ndarray,
                          tolerance: float = 1e-4,
                          max_iterations: int = 1_000_000,
-                         verbose: bool = True) -> np.ndarray:
+                         verbose: bool = True,
+                         relaxation: float = 0.25,
+                         enforce_nonnegativity: bool = True) -> np.ndarray:
     """
     Reconstruct volume from sinogram using Kaczmarz iteration.
     
@@ -520,6 +537,7 @@ def reconstruct_kaczmarz(geom: CTGeometry, sinogram: np.ndarray,
     - x = volume to reconstruct
     
     Uses a fast direct Kaczmarz loop with live progress and ETA.
+    Applies under-relaxation and non-negativity for CT-quality output.
     """
     print("\n" + "="*60)
     print("CT RECONSTRUCTION via Kaczmarz")
@@ -537,11 +555,16 @@ def reconstruct_kaczmarz(geom: CTGeometry, sinogram: np.ndarray,
         n_voxels=geom.Nvox,
         tolerance=tolerance,
         max_iterations=max_iterations,
-        seed=42
+        seed=42,
+        relaxation=relaxation,
+        enforce_nonnegativity=enforce_nonnegativity
     )
     
     # Reshape to volume
     volume = x.reshape((geom.npix, geom.npix, geom.npix))
+    
+    # Post-processing: clip to physical range [0, 1]
+    volume = np.clip(volume, 0.0, 1.0)
     
     print(f"\nReconstruction complete!")
     print(f"  Status     : {'CONVERGED' if info['converged'] else 'MAX ITERATIONS'}")
@@ -601,7 +624,9 @@ def demo_small_ct():
         geom, sinogram,
         tolerance=1e-3,
         max_iterations=100_000,
-        verbose=True
+        verbose=True,
+        relaxation=0.25,
+        enforce_nonnegativity=True
     )
     
     # Compare
@@ -623,9 +648,19 @@ def main():
     parser.add_argument('--output', '-o', help='Output reconstructed volume')
     parser.add_argument('--demo', action='store_true', help='Run small demo')
     parser.add_argument('--npix', type=int, default=512, help='Volume size')
-    parser.add_argument('--nproj', type=int, default=50, help='Number of projections to use')
+    parser.add_argument('--nproj', type=int, default=200, help='Number of projections to use')
     parser.add_argument('--tol', type=float, default=1e-4, help='Tolerance')
-    parser.add_argument('--maxiter', type=int, default=500_000, help='Max iterations')
+    parser.add_argument('--maxiter', type=int, default=2_000_000, help='Max iterations')
+    parser.add_argument('--relax', type=float, default=0.25,
+                        help='Relaxation parameter (0<\u03bb<2, default 0.25)')
+    parser.add_argument('--no-nonneg', action='store_true',
+                        help='Disable non-negativity constraint')
+    parser.add_argument('--sinogram', default=None,
+                        help='Path to save/load sinogram (.npy). Saves after '
+                             'forward projection; loads if file exists to skip it.')
+    parser.add_argument('--rerun', action='store_true',
+                        help='Skip forward projection, load sinogram from --sinogram '
+                             'and only re-run the Kaczmarz solver.')
     
     args = parser.parse_args()
     
@@ -641,21 +676,42 @@ def main():
         print("Consider using --nproj to limit the number of projections.")
         return
     
-    # Load phantom
-    phantom = load_phantom(args.input, args.npix)
-    
     # Setup geometry
     geom = CTGeometry(npix=args.npix, Npa=args.nproj)
     print(f"\nUsing {args.nproj} projections")
     
-    # Forward project
-    sinogram = forward_project(geom, phantom, args.nproj)
+    # --- Sinogram: load from cache or compute via forward projection ---
+    sinogram_path = args.sinogram
+    if args.rerun and sinogram_path and os.path.exists(sinogram_path):
+        # Rerun mode: skip phantom loading and forward projection entirely
+        print(f"\nLoading cached sinogram from: {sinogram_path}")
+        sinogram = np.load(sinogram_path)
+        print(f"  Sinogram length: {len(sinogram):,}")
+    elif sinogram_path and os.path.exists(sinogram_path):
+        # Cached sinogram exists – load it
+        print(f"\nLoading cached sinogram from: {sinogram_path}")
+        sinogram = np.load(sinogram_path)
+        print(f"  Sinogram length: {len(sinogram):,}")
+    else:
+        if not args.input:
+            print("ERROR: --input is required for forward projection.")
+            print("  Use --sinogram <path> with --rerun to skip forward projection.")
+            return
+        # Load phantom and forward project
+        phantom = load_phantom(args.input, args.npix)
+        sinogram = forward_project(geom, phantom, args.nproj)
+        # Save sinogram for future reuse
+        if sinogram_path:
+            np.save(sinogram_path, sinogram)
+            print(f"  Sinogram cached to: {sinogram_path}")
     
-    # Reconstruct
+    # --- Reconstruct ---
     recon = reconstruct_kaczmarz(
         geom, sinogram,
         tolerance=args.tol,
-        max_iterations=args.maxiter
+        max_iterations=args.maxiter,
+        relaxation=args.relax,
+        enforce_nonnegativity=not args.no_nonneg
     )
     
     # Save

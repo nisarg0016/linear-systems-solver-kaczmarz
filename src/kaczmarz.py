@@ -14,7 +14,6 @@ Mathematical Reference:
     Strohmer, T., & Vershynin, R. (2009). A randomized Kaczmarz algorithm 
     with exponential convergence. Journal of Fourier Analysis and Applications.
 
-Author: Advanced Algorithms Student
 Date: January 2026
 """
 
