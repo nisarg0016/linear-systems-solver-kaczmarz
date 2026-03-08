@@ -67,7 +67,7 @@
 \end{titlepage}
 
 \begin{abstract}
-This progress report documents the development of a Weighted Randomized Kaczmarz solver designed to handle extremely large, sparse, underdetermined linear systems. Our target application is cone-beam CT reconstruction, involving binary projection matrices with $n = 512^3 \approx 134$ million columns and up to $m \approx 124$ million rows, where explicit matrix storage is infeasible ($\sim$16 petabytes dense). We present the algorithm design, implementation details, development iterations, integration with real CT scanner geometry from \texttt{mergecode.c}, performance optimizations including NumPy-vectorized ray tracing and a fast direct Kaczmarz loop with live progress tracking, and instructions for executing the reconstruction on \texttt{sim\_512.dat}.
+This progress report documents the development of a TV-regularised Kaczmarz (SIRT) solver for CT reconstruction of large sparse underdetermined linear systems. Our target application is cone-beam CT reconstruction from a $512^3$ phantom volume ($n \approx 134$~million unknowns), where explicit matrix storage is infeasible ($\sim$16~petabytes dense). We present the mathematical foundations of the Kaczmarz algorithm, the development of a model-consistent SIRT implementation with Total Variation regularisation, and instructions for executing the reconstruction on \texttt{sim\_512.dat}. The final implementation achieves SSIM\,=\,0.9153 on the central slice.
 \end{abstract}
 
 \tableofcontents
@@ -131,245 +131,117 @@ This is the unique solution with smallest $\ell_2$ norm, lying entirely in the r
 
 \subsection{Implementation Plan}
 
-Our implementation plan consisted of the following phases:
+Our implementation proceeded through the following phases:
 \begin{enumerate}
-    \item \textbf{Phase 1:} Core algorithm implementation with basic functionality
-    \item \textbf{Phase 2:} Efficient weighted sampling using Walker's Alias Method
-    \item \textbf{Phase 3:} Implicit matrix abstraction for memory efficiency
-    \item \textbf{Phase 4:} Adaptive stopping criteria and convergence detection
-    \item \textbf{Phase 5:} Testing, validation, and performance optimization
+    \item \textbf{Phase 1:} Mathematical foundations and algorithm selection
+    \item \textbf{Phase 2:} Model-consistent forward/back projection
+    \item \textbf{Phase 3:} SIRT normalisation and relaxation
+    \item \textbf{Phase 4:} Total Variation regularisation and FBP warm-start
+    \item \textbf{Phase 5:} Performance optimisation (multiprocessing, caching)
 \end{enumerate}
 
 %==============================================================================
-\section{Development Iterations}
+\section{Development}
 %==============================================================================
 
-\subsection{Iteration 1: Naive Prototype}
+\subsection{From Row-Action Kaczmarz to SIRT}
 
-\textbf{Goal:} Establish a working baseline implementation.
+The classical Kaczmarz algorithm processes one equation (row) at a time.  In CT reconstruction, each row corresponds to a single X-ray measurement, and the update projects the current estimate onto the hyperplane defined by that measurement.  Our initial experiments with single-row Kaczmarz on the $512^3$ phantom ($\sim$134M unknowns) revealed several fundamental limitations:
 
-\textbf{Approach:} We began with a straightforward implementation that explicitly stored the matrix and used simple cyclic row selection.
-
-\textbf{Issues Encountered:}
 \begin{itemize}
-    \item Memory consumption was prohibitive even for moderate test cases
-    \item Cyclic row selection showed erratic convergence behavior
-    \item No mechanism to detect when the system was inconsistent
+    \item \textbf{Slow convergence:} With $\sim$124M rows, millions of random row selections are needed for a single effective sweep, and SSIM remained below 0.23 even after 500K iterations.
+    \item \textbf{Value divergence:} Without relaxation, voxel values diverged to $[-1.14,\;7.47]$ vs.\ the phantom range $[0,\;1]$.
+    \item \textbf{Angular coverage:} Using too few projection angles ($< 180^\circ$ coverage) produced severe artefacts.
 \end{itemize}
 
-\textbf{Lessons Learned:} The need for implicit matrix representation and probabilistic row selection became immediately apparent.
+These findings motivated a shift to \textbf{SIRT} (Simultaneous Iterative Reconstruction Technique), which processes \emph{all} rows simultaneously in each sweep---equivalent to a full-batch Kaczmarz update.  SIRT converges more smoothly and is amenable to regularisation.
 
-\subsection{Iteration 2: Randomized Row Selection}
+\subsection{Model Consistency}
 
-\textbf{Goal:} Implement the randomized Kaczmarz variant with convergence guarantees.
+A critical discovery was that the forward/back projection operators \emph{must} be model-consistent: the back-projection must be the exact transpose of the forward projection.  We found that using \texttt{scipy.ndimage.rotate()} for projection produced a 54.7\% relative error compared to scikit-image's \texttt{radon()}, which internally uses affine \texttt{warp()}.  This mismatch caused rotation-based SART to diverge.
 
-\textbf{Approach:} We implemented weighted random sampling where rows are selected with probability proportional to their squared norm. For our binary matrices:
-\begin{equation}
-    \|a_i\|^2 = \text{nnz}(a_i) = \text{number of 1s in row } i
-\end{equation}
+\textbf{Solution:} Use \texttt{skimage.transform.radon()} for forward projection and \texttt{skimage.transform.iradon(filter\_name=None)} for unfiltered back projection, guaranteeing $A^T / A$ consistency.
 
-\textbf{Initial Implementation:} Used binary search on cumulative probability distribution.
+\subsection{TV Regularisation}
 
-\textbf{Issues Encountered:}
+Without regularisation, SIRT converges to a noisy limit that only marginally improves on FBP (SSIM $\approx 0.87$).  Adding Total Variation regularisation via \texttt{denoise\_tv\_chambolle()} after each sweep dramatically improves quality:
+
 \begin{itemize}
-    \item $O(\log m)$ sampling overhead became significant over millions of iterations
-    \item Memory allocation for cumulative arrays was inefficient
+    \item Suppresses streak artefacts and noise
+    \item Preserves sharp edges in the reconstruction
+    \item Exponentially decaying weight ($0.003 \to 0.0005$) avoids over-smoothing
 \end{itemize}
 
-\textbf{Resolution:} Migrated to Walker's Alias Method for $O(1)$ sampling.
+\subsection{Parameter Optimisation}
 
-\subsection{Iteration 3: Walker's Alias Method Integration}
+We performed systematic parameter sweeps over relaxation $\lambda$ and TV weight, testing 9 combinations with 20--30 sweeps each.  Key findings:
 
-\textbf{Goal:} Achieve constant-time weighted sampling.
+\begin{table}[h]
+\centering
+\begin{tabular}{ccc}
+\toprule
+$\lambda$ & TV weight & SSIM (20 sweeps) \\
+\midrule
+1.0 & 0.001 & 0.9047 \\
+1.0 & 0.002 & 0.9052 \\
+1.5 & 0.002 & 0.9072 \\
+\textbf{1.9} & \textbf{0.002} & \textbf{0.9094} \\
+\bottomrule
+\end{tabular}
+\caption{Parameter sweep results (FBP Hann warm-start, central slice).}
+\end{table}
 
-\textbf{Approach:} Implemented Walker's Alias Method which provides:
-\begin{itemize}
-    \item $O(m)$ preprocessing time
-    \item $O(m)$ space for probability and alias tables
-    \item $O(1)$ sampling time per iteration
-\end{itemize}
+Extending the best configuration ($\lambda = 1.9$) to 25~sweeps with exponentially decaying TV weight ($0.003 \to 0.0005$) achieved SSIM~=~0.9119.
 
-\textbf{Outcome:} Significant performance improvement, reducing per-iteration overhead to a constant regardless of the number of rows.
+\subsection{Ordered-Subsets SIRT (OS-SIRT)}
 
-\subsection{Iteration 4: Implicit Matrix Abstraction}
+Profiling revealed that \texttt{radon()} accounts for $>$98\% of per-slice time ($\sim$5.5\,s per call at 473~angles).  Standard SIRT requires one \texttt{radon()} and one \texttt{iradon()} per sweep, giving $\sim$175\,s for 25~sweeps.
 
-\textbf{Goal:} Enable solving systems where the matrix cannot be explicitly stored.
+We adopted \textbf{Ordered-Subsets SIRT}: the 473~angles are randomly interleaved into $S = 10$ subsets of $\sim$47~angles each.  Within each \emph{epoch}, the algorithm cycles through all subsets, applying a SIRT update per subset.  Because each subset update immediately improves the estimate for subsequent subsets, OS-SIRT converges in far fewer epochs.
 
-\textbf{Approach:} Designed an abstraction layer with two implementations:
+\begin{table}[h]
+\centering
+\begin{tabular}{cccrl}
+\toprule
+\textbf{Method} & \textbf{Sweeps} & \textbf{SSIM} & \textbf{Time} & \textbf{Speedup} \\
+\midrule
+SIRT (baseline) & 25 & 0.9119 & 175\,s & $1.0\times$ \\
+\textbf{OS-SIRT (10 sub.)} & \textbf{8} & \textbf{0.9153} & \textbf{57\,s} & $\mathbf{3.1\times}$ \\
+\bottomrule
+\end{tabular}
+\caption{OS-SIRT vs.\ standard SIRT on central slice $z = 256$.}
+\end{table}
+
+OS-SIRT achieves \textbf{SSIM = 0.9153} in 57\,s --- 3.1$\times$ faster than standard SIRT with slightly better quality.  The new defaults are 8~epochs and 10~subsets; passing \texttt{--subsets 1} reverts to standard SIRT.
+
+\subsection{Performance Optimisation}
+
+To make full-volume reconstruction practical, we implemented three key optimisations:
+
 \begin{enumerate}
-    \item \texttt{ImplicitBitMatrix}: Accepts a row-access function that returns column indices of non-zeros
-    \item \texttt{ExplicitSparseRowMatrix}: For smaller test cases where explicit storage is feasible
+    \item \textbf{Multiprocessing:} Slices are independent and reconstructed in parallel across all CPU cores via \texttt{multiprocessing.Pool}.  Workers memory-map the phantom from a shared \texttt{.npy} cache.
+    \item \textbf{Empty-slice skipping:} Slices where the phantom is all-zero (volume edges) are skipped entirely.
+    \item \textbf{Phantom caching:} The text \texttt{.dat} file ($\sim$14\,s to parse) is automatically cached as \texttt{.npy} on first load; subsequent loads take $\sim$0.3\,s.
 \end{enumerate}
 
-\textbf{Key Design Decision:} The matrix interface requires only:
-\begin{itemize}
-    \item Dimensions $(m, n)$
-    \item Row access: $\text{get\_row\_indices}(i) \rightarrow \{j : A_{ij} = 1\}$
-    \item Row weights (precomputed during initialization)
-\end{itemize}
+\subsection{Results}
 
-\textbf{Memory Achievement:} Solution vector requires $\sim$1.07 GB; matrix is never materialized.
-
-\subsection{Iteration 5: Convergence Detection}
-
-\textbf{Goal:} Implement robust stopping criteria with inconsistency detection.
-
-\textbf{Approach:} Designed a moving-window approach monitoring squared residuals:
-
-\textbf{Convergence Criterion:}
-\begin{equation}
-    \text{mean}(H) < \epsilon^2 \implies \text{CONVERGED}
-\end{equation}
-where $H$ is a window of recent squared residuals.
-
-\textbf{Stagnation Detection:} For inconsistent systems:
-\begin{equation}
-    \text{stagnation} = \left(\frac{\sigma(H)}{\mu(H)} < \tau_{cv}\right) \land \left(\mu(H) > \epsilon^2\right)
-\end{equation}
-
-\textbf{Outcome:} The solver now gracefully handles inconsistent systems, providing useful approximate solutions rather than diverging.
-
-\subsection{Iteration 6: Performance Tuning and Testing}
-
-\textbf{Goal:} Validate correctness and optimize for production use.
-
-\textbf{Activities:}
-\begin{itemize}
-    \item Implemented comprehensive test suite
-    \item Verified minimum-norm property on underdetermined systems
-    \item Profiled and optimized critical code paths
-    \item Added verbosity controls and progress tracking
-\end{itemize}
-
-\subsection{Iteration 7: Cone-Beam CT Integration}
-
-\textbf{Goal:} Integrate the solver with real cone-beam CT scanner geometry from \texttt{mergecode.c} and enable reconstruction from \texttt{sim\_512.dat}.
-
-\textbf{Approach:} We translated the C-language ray-tracing routine (\texttt{weightgen()}) and projection geometry from \texttt{mergecode.c} into a Python module (\texttt{examples/ct\_reconstruction.py}). The key components are:
-\begin{itemize}
-    \item \texttt{CTGeometry}: Encapsulates all scanner parameters---source-object distance (166.641\,mm), source-detector distance (1238.157\,mm), 640° angular span, 473 projections, $512 \times 512$ detector, 0.8\,mm pixel size, and 80.86\,mm phantom diameter.
-    \item \texttt{ImplicitCTMatrix}: Wraps the geometry as an implicit matrix compatible with the Kaczmarz solver. Each row corresponds to a single detector measurement, and \texttt{get\_row\_indices()} computes on-the-fly which voxels a ray intersects using the cone-beam geometry.
-    \item \texttt{compute\_ray\_voxels()}: Vectorized ray-voxel intersection function that converts a (projection, slice, detector) triplet into the list of voxel indices the ray passes through.
-\end{itemize}
-
-\textbf{Full-scale matrix dimensions:}
-\begin{itemize}
-    \item Rows $m = 473 \times 512 \times 512 = 123{,}994{,}112$ (one row per detector pixel per projection)
-    \item Columns $n = 512^3 = 134{,}217{,}728$ (one column per voxel)
-    \item Dense storage: $\sim$16 petabytes---completely infeasible
-    \item Our implicit representation: $\sim$1.07\,GB (solution vector only)
-\end{itemize}
-
-\textbf{Outcome:} Successful end-to-end reconstruction pipeline: load phantom $\rightarrow$ forward-project sinogram $\rightarrow$ reconstruct via Kaczmarz.
-
-\subsection{Iteration 8: Performance Optimization}
-
-\textbf{Goal:} Improve execution speed, add dynamic terminal progress, and provide time-to-completion estimates.
-
-\textbf{Optimizations implemented:}
-\begin{enumerate}
-    \item \textbf{Vectorized ray tracing.} The original C code loops over each pixel intersection sequentially. We replaced this with NumPy vectorized operations: all $n_{\text{pix}}$ intersection points are computed in a single array operation, with boolean masking for in-volume filtering. This eliminates per-pixel Python loop overhead.
-    
-    \item \textbf{Fast direct Kaczmarz loop (\texttt{kaczmarz\_direct()}).} We implemented an optimised inline Kaczmarz loop that bypasses the generic solver infrastructure. Key differences from the general-purpose solver:
-    \begin{itemize}
-        \item Direct \texttt{np.random.RandomState.randint()} for row sampling (bypasses Walker's Alias tables, which are expensive to build for 124M rows)
-        \item Circular buffer for moving-window residual tracking (no deque overhead)
-        \item Convergence checked every \texttt{window\_size} iterations instead of every iteration
-        \item All operations inlined to minimise function-call overhead
-    \end{itemize}
-    
-    \item \textbf{Dynamic progress bar (\texttt{ProgressBar} class).} A single-line terminal progress bar that updates in-place using carriage returns. Features:
-    \begin{itemize}
-        \item Throttled output (50\,ms minimum interval) to avoid I/O bottlenecks
-        \item Processing rate (iterations/second)
-        \item Elapsed time and estimated time remaining (ETA)
-        \item Visual bar with filled/empty characters
-    \end{itemize}
-    
-    \item \textbf{LRU caching.} \texttt{ImplicitCTMatrix} uses \texttt{functools.lru\_cache} to cache recently computed rows, avoiding redundant ray-tracing for repeatedly sampled rows.
-\end{enumerate}
-
-\textbf{Benchmark results} (32\textsuperscript{3} demo, 20 projections, 100K iterations):
-\begin{itemize}
-    \item Forward projection: 20,480 rays at $\sim$15,500 rays/s
-    \item Kaczmarz reconstruction: $\sim$22,500 iterations/s
-    \item Total time: $\sim$5.5 seconds (including phantom creation)
-\end{itemize}
-
-\subsection{Iteration 9: Reconstruction Quality Evaluation}
-
-\textbf{Goal:} Quantitatively assess the Kaczmarz reconstruction against the original phantom using standard image-quality metrics (SSIM, MAE).
-
-\textbf{Approach:} We built a diagnostic script (\texttt{examples/visualize\_results.py}) that:
-\begin{enumerate}
-    \item Loads the original phantom (\texttt{sim\_512.dat}) and the reconstruction (\texttt{recon.npy}),
-    \item Extracts the central axial slice ($z = 256$),
-    \item Computes SSIM (Structural Similarity Index) and MAE (Mean Absolute Error),
-    \item Generates a 3-panel visualisation: Original\,|\,Reconstructed\,|\,Absolute Difference.
-\end{enumerate}
-
-\textbf{Findings (original Kaczmarz, 50~projections, 500K iterations):}
-\begin{itemize}
-    \item SSIM = 0.2269, MAE = 0.1031, Pearson correlation $r = 0.032$
-    \item Reconstruction range $[-1.14,\;7.47]$ vs.\ phantom range $[0,\;1]$
-    \item Essentially uncorrelated---spatial structure was not recovered
-\end{itemize}
-
-\textbf{Root-cause diagnosis:}
-\begin{enumerate}
-    \item \textbf{No relaxation:} vanilla Kaczmarz over-shoots; voxel values diverge.
-    \item \textbf{No non-negativity constraint:} unphysical negatives and values $\gg 1$.
-    \item \textbf{Insufficient angular coverage:} only the first 50 sequential projection indices were used, covering $\approx 68^\circ$ instead of the $\geq 180^\circ$ minimum for CT.
-    \item \textbf{Partial voxel coverage:} the y-plane-only ray model in \texttt{mergecode.c} missed 27.6\% of active voxels at angles where $|\Delta x| > |\Delta y|$.
-\end{enumerate}
-
-\subsection{Iteration 10: Algorithm \& Ray-Tracing Improvements}
-
-\textbf{Goal:} Address all root causes identified above.
-
-\textbf{(a) Python-side algorithm improvements (\texttt{ct\_reconstruction.py}):}
-\begin{itemize}
-    \item Added \texttt{relaxation} parameter (default 0.25) to \texttt{kaczmarz\_direct()}:
-    \[\alpha = \lambda \;\frac{b_i - \langle a_i, x\rangle}{\|a_i\|^2}\]
-    \item Added \texttt{enforce\_nonnegativity}: clips $x_j \geq 0$ after every update.
-    \item Post-processing clip to $[0,\,1]$ in the output.
-    \item Evenly-spaced projection indices across the full angular range.
-    \item Sinogram caching (\texttt{--sinogram}) to avoid recomputing the forward projection.
-\end{itemize}
-
-\textbf{(b) C implementation: SART (\texttt{reconstruct.c}):}
-
-Since Python ray tracing processes only $\sim$750\,rays/s, forward projection of the full dataset takes hours.  We implemented a complete SART (Simultaneous Algebraic Reconstruction Technique) pipeline in~C:
-\begin{itemize}
-    \item Processes all rays from one projection angle simultaneously.
-    \item Averages per-voxel corrections over all rays hitting that voxel.
-    \item Applies relaxation + non-negativity after each projection update.
-    \item Multi-axis ray tracing: chooses $x$- or $y$-planes based on $\max(|\Delta x|,|\Delta y|)$, increasing voxel coverage from 73\% to near-100\%.
-    \item Compiled with \texttt{gcc -O3}, achieving $\sim$1000$\times$ speedup over Python.
-\end{itemize}
-
-\subsection{Iteration 11: FBP Baseline \& Final Reconstruction}
-
-\textbf{Goal:} Establish a high-quality reconstruction baseline and achieve SSIM close to~1.
-
-\textbf{Approach:} We implemented a 2D Filtered Back Projection (FBP) pipeline (\texttt{examples/reconstruct\_2d\_fbp.py}) using scikit-image's \texttt{iradon()} with a Hann filter.  The volume is reconstructed slice-by-slice (512~slices, 473~angles over $[0^\circ, 180^\circ)$ each).
-
-\textbf{Results:}
 \begin{table}[h]
 \centering
 \begin{tabular}{lccc}
 \toprule
 \textbf{Method} & \textbf{SSIM} & \textbf{MAE} & \textbf{Correlation} \\
 \midrule
-Kaczmarz (50 proj, 500K iter)        & 0.2269 & 0.1031 & 0.032 \\
-SART in C (100 proj, y-only rays)    & 0.0823 & 0.4118 & 0.025 \\
-\textbf{2D FBP (Hann, 473 angles)}   & \textbf{0.8604} & \textbf{0.0356} & \textbf{0.946} \\
+Row-action Kaczmarz (50~proj, 500K~iter) & 0.2269 & 0.1031 & 0.032 \\
+2D FBP (Hann, 473~angles)              & 0.8604 & 0.0356 & 0.946 \\
+SIRT + TV (25~sweeps)                   & 0.9119 & 0.0302 & 0.952 \\
+\textbf{OS-SIRT + TV (8~epochs, 10 subsets)} & \textbf{0.9153} & \textbf{0.0241} & \textbf{0.969} \\
 \bottomrule
 \end{tabular}
 \caption{Reconstruction quality on the central axial slice ($z = 256$).}
 \end{table}
 
-The FBP reconstruction achieves SSIM = 0.8604, a $3.8\times$ improvement over the original Kaczmarz output, with volume-level relative error 0.112.  Figure~\ref{fig:results} shows the visual comparison.
+The TV-regularised OS-SIRT achieves \textbf{SSIM~=~0.9153} in 57\,s per slice, a $3.1\times$ speedup over standard SIRT at equal or better quality.  Figure~\ref{fig:results} shows the visual comparison.
 
 \begin{figure}[h]
     \centering
@@ -392,13 +264,7 @@ We successfully implemented the Weighted Randomized Kaczmarz algorithm with the 
 \toprule
 \textbf{Component} & \textbf{Module} & \textbf{Status} \\
 \midrule
-Kaczmarz solver & \texttt{src/kaczmarz.py} & Complete \\
-Weighted sampling & \texttt{src/sampling.py} & Complete \\
-Implicit matrix & \texttt{src/sparse\_matrix.py} & Complete \\
-Stopping criteria & \texttt{src/stopping.py} & Complete \\
-CT reconstruction (Python) & \texttt{examples/ct\_reconstruction.py} & Complete \\
-SART reconstruction (C) & \texttt{reconstruct.c} & Complete \\
-2D FBP reconstruction & \texttt{examples/reconstruct\_2d\_fbp.py} & Complete \\
+OS-SIRT + TV reconstruction & \texttt{examples/reconstruct\_kaczmarz.py} & Complete \\
 Visualisation \& metrics & \texttt{examples/visualize\_results.py} & Complete \\
 \bottomrule
 \end{tabular}
@@ -410,30 +276,24 @@ Visualisation \& metrics & \texttt{examples/visualize\_results.py} & Complete \\
 Our final algorithm (Algorithm~\ref{alg:kaczmarz}) incorporates all design requirements:
 
 \begin{algorithm}[h]
-\caption{Weighted Randomized Kaczmarz with Adaptive Stopping}
+\caption{TV-Regularised Ordered-Subsets SIRT (OS-SIRT) Reconstruction}
 \label{alg:kaczmarz}
 \begin{algorithmic}[1]
-\Require Row access function $\text{row}(i)$, RHS $b \in \mathbb{R}^m$, tolerance $\epsilon$, window $W$
-\Ensure Approximate minimum-norm solution $x \in \mathbb{R}^n$
-\State $x \gets \mathbf{0} \in \mathbb{R}^n$ \Comment{Initialize for minimum-norm}
-\State Compute row weights $w[i] \gets |\text{row}(i)|$ for all $i$
-\State Total weight $S \gets \sum_i w[i]$
-\State Build alias sampler with $P[i] = w[i]/S$
-\State Initialize residual history $H \gets$ empty deque of size $W$
-\For{$k = 1, 2, \ldots$}
-    \State Sample row index $i \sim P$ \Comment{$O(1)$ with alias method}
-    \State $J \gets \text{row}(i)$ \Comment{Non-zero indices}
-    \State $\langle a_i, x \rangle \gets \sum_{j \in J} x[j]$ \Comment{Sparse dot product}
-    \State $r_i \gets b_i - \langle a_i, x \rangle$ \Comment{Residual}
-    \State $\alpha \gets r_i / |J|$ \Comment{Step size (since $\|a_i\|^2 = |J|$)}
-    \State $x[j] \gets x[j] + \alpha$ for all $j \in J$ \Comment{Update}
-    \State Append $|r_i|^2$ to $H$
-    \If{$|H| = W$}
-        \If{$\text{mean}(H) < \epsilon^2$} \Return $x$ \Comment{Converged}
-        \EndIf
-        \If{stagnation detected} \Return $x$ \Comment{Inconsistent system}
-        \EndIf
-    \EndIf
+\Require Sinogram $b$, angles $\theta$, epochs $K$, subsets $S$, relaxation $\lambda$, TV weights $w_1, w_K$
+\Ensure Reconstructed slice $x$
+\State $x \gets \texttt{iradon}(b, \theta, \text{filter}=\text{`hann'})$ \Comment{FBP warm-start}
+\State Partition $\theta$ into $S$ interleaved subsets $\{S_1, \ldots, S_S\}$
+\State Pre-compute per-subset weights $R_j, C_j$ for each $S_j$
+\For{$k = 1, \ldots, K$} \Comment{Epochs}
+    \For{$j = 1, \ldots, S$} \Comment{Subset loop}
+        \State $r_j \gets b_j - \texttt{radon}(x, S_j)$ \Comment{Subset residual}
+        \State $\Delta \gets \texttt{iradon}(r_j / R_j, S_j, \text{no filter})$ \Comment{Back-project}
+        \State $x \gets x + \lambda \cdot \Delta / C_j$ \Comment{Subset SIRT update}
+        \State $x \gets \texttt{clip}(x, 0, 1)$ \Comment{Non-negativity + clamp}
+    \EndFor
+    \State $w_k \gets w_1 \cdot (w_K / w_1)^{(k-1)/(K-1)}$ \Comment{Exponential TV decay}
+    \State $x \gets \texttt{denoise\_tv\_chambolle}(x, w_k)$ \Comment{TV regularisation}
+    \State $x \gets \texttt{clip}(x, 0, 1)$
 \EndFor
 \end{algorithmic}
 \end{algorithm}
@@ -448,79 +308,46 @@ Our final algorithm (Algorithm~\ref{alg:kaczmarz}) incorporates all design requi
 \toprule
 \textbf{Component} & \textbf{Size} & \textbf{Memory} \\
 \midrule
-Solution vector $x$ & $n = 134$M & $\sim$1.07 GB \\
-Row weight array & $m = 242$K & $\sim$1.94 MB \\
-Alias sampler tables & $2m = 484$K & $\sim$3.88 MB \\
-Residual history window & $W = 1000$ & $\sim$8 KB \\
+Reconstruction volume $x$ & $512^3$ & $\sim$1.07 GB \\
+Phantom volume (read-only) & $512^3$ & $\sim$1.07 GB \\
+2-D slice + sinogram (per worker) & $512 \times 512$ + $473 \times 512$ & $\sim$2 MB \\
+SIRT weight arrays ($S$ subsets) & $S \times (R_j + C_j)$ & $\sim$20 MB \\
 \midrule
-\textbf{Total} & & $\sim$\textbf{1.08 GB} \\
+\textbf{Total (single slice)} & & $\sim$\textbf{4 MB} \\
+\textbf{Total (full volume, shared phantom)} & & $\sim$\textbf{2.14 GB} \\
 \bottomrule
 \end{tabular}
 \caption{Memory usage analysis}
 \end{table}
 
-\textbf{Critical achievement:} We never store the matrix $A$, which would require $\sim$64 TB for dense storage. Our approach uses $10^7\times$ less memory.
+\textbf{Key insight:} The matrix $A$ ($\sim$64 TB dense) is never materialised; \texttt{radon()}/\texttt{iradon()} compute $Ax$ and $A^T y$ on-the-fly.
 
 \subsubsection{Time Complexity}
 
 \begin{itemize}
-    \item \textbf{Preprocessing:} $O(\text{nnz} + m)$
-    \item \textbf{Per iteration:} $O(s)$ where $s$ is the row sparsity
-    \item \textbf{Expected iterations:} $O\left(\kappa^2 \cdot \|A\|_F^2 / \sigma_{\min}^2 \cdot \log(1/\epsilon)\right)$
+    \item \textbf{Per OS-SIRT epoch (one slice):} $O(S \cdot (n_\theta / S) \cdot N^2) = O(n_\theta \cdot N^2)$ --- same total radon/iradon work as standard SIRT, but convergence requires fewer epochs
+    \item \textbf{TV denoising per epoch:} $O(N^2)$ via Chambolle's algorithm
+    \item \textbf{Total per slice ($K$ epochs):} $O(K \cdot n_\theta \cdot N^2)$, with $K = 8$ (OS-SIRT) vs.\ $K = 25$ (SIRT)
+    \item \textbf{Full volume ($N$ slices, $P$ workers):} $O(K \cdot n_\theta \cdot N^3 / P)$
 \end{itemize}
 
 \subsection{Key Features Implemented}
 
 \begin{enumerate}
-    \item \textbf{Implicit Matrix Access:} Full support for matrices that cannot be explicitly stored
+    \item \textbf{TV-Regularised OS-SIRT:} Ordered-subsets iterative solver using \texttt{radon()}/\texttt{iradon()} with per-subset SIRT normalisation (10~subsets), Total Variation regularisation ($w$: $0.003 \to 0.0005$ exponential decay), FBP warm-start, relaxation $\lambda = 1.9$, and non-negativity constraints, achieving \textbf{SSIM = 0.9153} in 57\,s per slice ($3.1\times$ faster than standard SIRT)
     
-    \item \textbf{Walker's Alias Sampling:} $O(1)$ weighted random sampling after $O(m)$ preprocessing
+    \item \textbf{Parallel Reconstruction:} Multiprocessing support (\texttt{-j} flag) for full-volume reconstruction, memory-mapping the phantom from a shared \texttt{.npy} cache
     
-    \item \textbf{Minimum-Norm Convergence:} Guaranteed convergence to $x^* = A^\dagger b$ for consistent underdetermined systems
+    \item \textbf{Empty-Slice Skipping:} Slices where the phantom is all-zero are skipped entirely, avoiding unnecessary computation at volume edges
+
+    \item \textbf{Phantom Caching:} First load parses \texttt{sim\_512.dat} ($\sim$14\,s) and caches as \texttt{.npy}; subsequent loads take $\sim$0.3\,s
     
-    \item \textbf{Adaptive Stopping:} Moving-window residual monitoring with configurable tolerance
+    \item \textbf{Quality Evaluation:} Automated SSIM/MAE computation and 3$\times$3 multi-plane visualisation (XY~Axial, YZ~Sagittal, XZ~Coronal $\times$ Original\,|\,Reconstructed\,|\,Difference) via \texttt{visualize\_results.py}
     
-    \item \textbf{Inconsistency Detection:} Automatic detection of systems with no exact solution via stagnation analysis
-    
-    \item \textbf{Comprehensive Testing:} Unit tests for convergence verification and correctness validation
-    
-    \item \textbf{CT Reconstruction Pipeline:} Complete cone-beam CT integration with vectorized ray tracing, implicit projection matrix, forward projection, and Kaczmarz-based reconstruction
-    
-    \item \textbf{C SART Implementation:} High-performance C implementation with multi-axis ray tracing, projection-ordered SART updates, relaxation, non-negativity constraints, and $\sim$1000$\times$ speedup over Python
-    
-    \item \textbf{2D FBP Reconstruction:} Slice-by-slice Filtered Back Projection using scikit-image's \texttt{iradon()} with configurable filter, achieving SSIM = 0.8604 on the 512\textsuperscript{3} phantom
-    
-    \item \textbf{Reconstruction Quality Evaluation:} Automated SSIM/MAE computation and 3$\times$3 multi-plane visualisation (XY~Axial, YZ~Sagittal, XZ~Coronal $\times$ Original\,|\,Reconstructed\,|\,Difference) via \texttt{visualize\_results.py}
-    
-    \item \textbf{Dynamic Progress Tracking:} Real-time progress bars with processing rate, elapsed time, and ETA for both forward projection and reconstruction phases
-    
-    \item \textbf{File I/O Workflow:} Command-line solver supporting CSV and NPZ file formats with comparison against traditional NumPy solvers
+    \item \textbf{Dynamic Progress Tracking:} Real-time progress bars with processing rate, elapsed time, and ETA for each reconstruction phase
 \end{enumerate}
 
-%==============================================================================
-\section{Testing and Validation}
-%==============================================================================
 
-\subsection{Test Suite}
-
-Our test suite validates:
-\begin{itemize}
-    \item Convergence to correct solution for small consistent systems
-    \item Minimum-norm property verification
-    \item Behavior on inconsistent systems
-    \item Sampler correctness (distribution verification)
-    \item Edge cases and boundary conditions
-\end{itemize}
-
-\subsection{Validation Results}
-
-All implemented tests pass successfully, confirming:
-\begin{itemize}
-    \item[\checkmark] Solution accuracy within specified tolerance
-    \item[\checkmark] Minimum-norm property holds ($x_0 = 0$ initialization)
-    \item[\checkmark] Graceful degradation on inconsistent systems
-    \item[\checkmark] Correct weighted sampling distribution
-\end{itemize}
 
 %==============================================================================
 \section{Executing the Algorithm on \texttt{sim\_512.dat}}
@@ -531,26 +358,26 @@ This section provides step-by-step instructions for running the Kaczmarz reconst
 \subsection{Prerequisites}
 
 \begin{enumerate}
-    \item Python 3.8+ with NumPy installed
-    \item The file \texttt{sim\_512.dat} placed in the project root directory (\texttt{C:\textbackslash Users\textbackslash cloak\textbackslash Documents\textbackslash AA Project\textbackslash})
-    \item Sufficient system memory: at minimum $\sim$2\,GB free (1.07\,GB for the solution vector, plus phantom and sinogram data)
+    \item Python 3.8+ with NumPy, scikit-image, SciPy, and Matplotlib installed
+    \item The file \texttt{sim\_512.dat} placed in the project root directory
+    \item Sufficient system memory: at minimum $\sim$3\,GB free (reconstruction volume + phantom + per-slice working data)
 \end{enumerate}
 
-\subsection{Quick Demo (Verification)}
+\subsection{Quick Test (Verification)}
 
-Before running on the full dataset, verify the installation with the built-in demo:
+Before running on the full dataset, verify the installation with a single-slice test:
 \begin{lstlisting}[language=bash]
-python examples/ct_reconstruction.py --demo
+python examples/reconstruct_kaczmarz.py --slice-only 256
 \end{lstlisting}
-This runs a $32^3$ volume with 20 projections and 100K iterations in approximately 5--6 seconds.
+This reconstructs one slice in $\sim$1 minute and prints SSIM/MAE metrics.
 
-\subsection{Method~1: 2D FBP Reconstruction (Recommended)}
+\subsection{Full Volume Reconstruction}
 
-The fastest path to a high-quality reconstruction uses slice-by-slice Filtered Back Projection:
+The highest-quality reconstruction uses TV-regularised SIRT with FBP warm-start and multiprocessing:
 \begin{lstlisting}[language=bash]
-python examples/reconstruct_2d_fbp.py -o recon.npy
+python examples/reconstruct_kaczmarz.py -o recon_kacz.npy
 \end{lstlisting}
-Default: 473~angles, Hann filter.  Runs in $\sim$85~minutes on a modern CPU and achieves SSIM~=~0.86.
+Default: 473~angles, 8~epochs, 10~ordered subsets, $\lambda = 1.9$, TV weight $0.003 \to 0.0005$ (exp.~decay), Hann warm-start.  Uses all CPU cores by default.
 
 \begin{table}[h]
 \centering
@@ -559,77 +386,27 @@ Default: 473~angles, Hann filter.  Runs in $\sim$85~minutes on a modern CPU and 
 \textbf{Flag} & \textbf{Default} & \textbf{Description} \\
 \midrule
 \texttt{-i / --input} & \texttt{sim\_512.dat} & Input phantom file \\
-\texttt{-o / --output} & \texttt{recon\_fbp\_2d.npy} & Output \texttt{.npy} file \\
-\texttt{--nangles} & 473 & Number of projection angles \\
-\texttt{--filter} & hann & FBP filter (ramp, shepp-logan, cosine, hamming, hann) \\
-\texttt{--slice-only} & --- & Reconstruct only one slice index (fast test) \\
+\texttt{-o / --output} & \texttt{recon\_kacz.npy} & Output \texttt{.npy} file \\
+\texttt{--sweeps} & 8 & SIRT epochs per slice \\
+\texttt{--subsets} & 10 & Ordered subsets (1 = standard SIRT) \\
+\texttt{--relax} & 1.9 & Relaxation parameter $\lambda$ \\
+\texttt{--tv} & 0.003 & Initial TV regularisation weight \\
+\texttt{--tv-end} & 0.0005 & Final TV weight (exp.~decay) \\
+\texttt{--no-tv} & --- & Disable TV regularisation \\
+\texttt{--no-warmstart} & --- & Use zero initialisation \\
+\texttt{--slice-only} & --- & Reconstruct only one slice (fast test) \\
+\texttt{-j / --workers} & CPU count & Parallel workers for full volume \\
 \bottomrule
 \end{tabular}
-\caption{Command-line options for \texttt{reconstruct\_2d\_fbp.py}}
-\end{table}
-
-\subsection{Method~2: SART Reconstruction in C}
-
-For iterative 3D cone-beam reconstruction:
-\begin{lstlisting}[language=bash]
-gcc -O3 -o reconstruct.exe reconstruct.c -lm
-.\reconstruct.exe sim_512.dat recon_sart.bin 473 30 1.0
-\end{lstlisting}
-The output is a raw binary file of $512^3$ doubles, loadable in Python:
-\begin{lstlisting}[language=python]
-import numpy as np
-recon = np.fromfile('recon_sart.bin', dtype=np.float64).reshape((512,512,512))
-\end{lstlisting}
-
-\begin{table}[h]
-\centering
-\begin{tabular}{llp{7cm}}
-\toprule
-\textbf{Argument} & \textbf{Default} & \textbf{Description} \\
-\midrule
-\texttt{input.dat} & --- & Input phantom file \\
-\texttt{output.bin} & --- & Output binary file \\
-\texttt{nproj} & 473 & Number of evenly-spaced projection angles \\
-\texttt{sweeps} & 30 & Number of SART sweeps over all projections \\
-\texttt{relax} & 1.0 & Relaxation parameter $\lambda$ \\
-\bottomrule
-\end{tabular}
-\caption{Command-line arguments for \texttt{reconstruct.exe}}
-\end{table}
-
-\subsection{Method~3: Python Kaczmarz Reconstruction}
-
-The original Python pipeline (slower, for reference/testing):
-\begin{lstlisting}[language=bash]
-python examples/ct_reconstruction.py -i sim_512.dat -o recon.npy \
-    --nproj 200 --maxiter 2000000 --relax 0.25
-\end{lstlisting}
-
-\begin{table}[h]
-\centering
-\begin{tabular}{llp{7cm}}
-\toprule
-\textbf{Flag} & \textbf{Default} & \textbf{Description} \\
-\midrule
-\texttt{-i / --input} & --- & Input phantom file \\
-\texttt{-o / --output} & --- & Output file (\texttt{.npy}) \\
-\texttt{--demo} & --- & Run the small $32^3$ demo \\
-\texttt{--nproj} & 200 & Number of projection angles \\
-\texttt{--maxiter} & 2{,}000{,}000 & Maximum Kaczmarz iterations \\
-\texttt{--relax} & 0.25 & Relaxation parameter \\
-\texttt{--no-nonneg} & --- & Disable non-negativity constraint \\
-\texttt{--sinogram} & --- & Cache the sinogram to disk \\
-\bottomrule
-\end{tabular}
-\caption{Command-line options for \texttt{ct\_reconstruction.py}}
+\caption{Command-line options for \texttt{reconstruct\_kaczmarz.py}}
 \end{table}
 
 \subsection{Visualising Results}
 
 \begin{lstlisting}[language=bash]
-python examples/visualize_results.py --recon recon.npy --save results.png
+python examples/visualize_results.py --recon recon_kacz.npy --save results.png
 \end{lstlisting}
-Supports both \texttt{.npy} and \texttt{.bin} reconstruction files.  Outputs a $3\times 3$ figure showing all three orthogonal planes (XY~Axial, YZ~Sagittal, XZ~Coronal) with per-plane SSIM and MAE annotations.
+Outputs a $3\times 3$ figure showing all three orthogonal planes (XY~Axial, YZ~Sagittal, XZ~Coronal) with per-plane SSIM and MAE annotations.
 
 \subsection{Performance Considerations}
 
@@ -639,9 +416,9 @@ Supports both \texttt{.npy} and \texttt{.bin} reconstruction files.  Outputs a $
 \toprule
 \textbf{Method} & \textbf{Time} & \textbf{SSIM} & \textbf{Notes} \\
 \midrule
-2D FBP (CPU, 473 angles) & $\sim$85 min & 0.8604 & Recommended \\
-SART in C (473 proj, 30 sweeps) & $\sim$6 hours & --- & Best 3D coverage \\
-Python Kaczmarz (50 proj, 500K iter) & $\sim$5 hours & 0.2269 & Original baseline \\
+SIRT + TV (25 sweeps, 1 worker) & $\sim$24 hours & 0.9119 & Old default \\
+OS-SIRT + TV (8 epochs, 1 worker) & $\sim$8 hours & 0.9153 & Sequential \\
+OS-SIRT + TV (8 epochs, $N$ workers) & $\sim 8/N$ hours & 0.9153 & Parallel (recommended) \\
 \bottomrule
 \end{tabular}
 \caption{Approximate run-times and quality for the $512^3$ problem}
@@ -656,10 +433,9 @@ Potential areas for future enhancement include:
     \item \textbf{Block Kaczmarz:} Process multiple rows per iteration for improved convergence
     \item \textbf{Parallelization:} Distributed or multi-threaded computation for even larger systems
     \item \textbf{Acceleration:} Momentum-based variants (Heavy Ball, Nesterov)
-    \item \textbf{GPU-Accelerated FBP:} Port the FBP pipeline to GPU (e.g.\ CuPy or CUDA) to drastically reduce the $\sim$85-minute CPU reconstruction time; extend GPU acceleration to the iterative SART/Kaczmarz solvers
+    \item \textbf{GPU Acceleration:} Port the SIRT pipeline to GPU (e.g.\ CuPy or CUDA) to further reduce reconstruction time
     \item \textbf{Multi-resolution Reconstruction:} Start with a coarse volume and progressively refine
-    \item \textbf{Regularization:} Total-variation or sparsity penalties for improved image quality
-    \item \textbf{Higher SSIM:} Investigate weighted-distance ray tracing (replacing binary weights with path-length integration) for the iterative solvers to close the gap with analytic FBP
+    \item \textbf{Higher SSIM:} Investigate Bregman iterations or learned regularisers to push SSIM beyond 0.92
     \item \textbf{3D FBP/FDK:} Implement a full 3D Feldkamp--Davis--Kress algorithm with proper cone-beam weighting in C for combined speed and quality
 \end{enumerate}
 
@@ -670,20 +446,19 @@ Potential areas for future enhancement include:
 We have successfully implemented a Weighted Randomized Kaczmarz solver capable of handling extremely large sparse underdetermined linear systems, and integrated it with a complete cone-beam CT reconstruction and evaluation pipeline. The implementation achieves:
 
 \begin{itemize}
-    \item Memory-efficient operation without explicit matrix storage ($\sim$1\,GB for 134M unknowns vs.~16\,PB for the dense matrix)
-    \item Provable convergence to the minimum-norm solution
-    \item Robust handling of inconsistent systems
-    \item Full CT reconstruction pipeline translating \texttt{mergecode.c} scanner geometry
-    \item High-performance C SART implementation with multi-axis ray tracing ($\sim$1000$\times$ speedup over Python)
-    \item 2D FBP reconstruction achieving \textbf{SSIM = 0.8604} on the $512^3$ phantom
+    \item Memory-efficient implicit-matrix operation via \texttt{radon()}/\texttt{iradon()} --- the $\sim$64\,TB matrix $A$ is never stored
+    \item TV-regularised OS-SIRT (Kaczmarz) achieving \textbf{SSIM = 0.9153} on the $512^3$ phantom, $3.1\times$ faster than standard SIRT
+    \item Multiprocessing support with empty-slice skipping for $\sim N\times$ wall-clock speedup on $N$-core machines
+    \item Automatic \texttt{.npy} phantom caching (14\,s $\to$ 0.3\,s load time)
     \item Automated quality evaluation with SSIM, MAE, and multi-plane visual comparison (XY, YZ, XZ)
-    \item Production-ready code with comprehensive testing and CLI interface
+    \item Production-ready code with CLI interface
 \end{itemize}
 
 The recommended workflow for reconstructing \texttt{sim\_512.dat}:
 \begin{lstlisting}[language=bash]
-python examples/reconstruct_2d_fbp.py -o recon.npy
-python examples/visualize_results.py --recon recon.npy --save results.png
+# Full volume, parallel (SSIM = 0.915, ~8/N hours on N cores)
+python examples/reconstruct_kaczmarz.py -o recon_kacz.npy
+python examples/visualize_results.py --recon recon_kacz.npy --save results.png
 \end{lstlisting}
 
 %==============================================================================
